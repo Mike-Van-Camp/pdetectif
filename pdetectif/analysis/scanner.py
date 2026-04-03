@@ -431,9 +431,14 @@ def format_scan_report(result, verbose=False):
     info = result.document_info
 
     # Header
-    lines.append("=" * 65)
-    lines.append("  PDetectiF - PDF Security Analysis Report")
-    lines.append("=" * 65)
+    lines.append("")
+    lines.append("  ____  ____       _            _   _ _____")
+    lines.append(" |  _ \\|  _ \\  ___| |_ ___  ___| |_(_)  ___|")
+    lines.append(" | |_) | | | |/ _ \\ __/ _ \\/ __| __| | |_")
+    lines.append(" |  __/| |_| |  __/ ||  __/ (__| |_| |  _|")
+    lines.append(" |_|   |____/ \\___|\\__\\___|\\___|\\__|_|_|")
+    lines.append("")
+    lines.append("=" * 50)
 
     # Document info
     lines.append("")
@@ -515,7 +520,7 @@ def format_scan_report(result, verbose=False):
             lines.append(f"    • {f}")
 
     lines.append("")
-    lines.append("=" * 65)
+    lines.append("=" * 50)
 
     return "\n".join(lines)
 

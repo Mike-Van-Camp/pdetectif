@@ -58,14 +58,16 @@ def extract_urls(doc):
     results = {
         "urls": [],
         "uri_actions": [],
+        "external_references": [],
         "total": 0,
     }
 
     seen = set()
 
-    # Method 1: Extract from /URI actions in parsed objects
+    # Method 1: Extract from /URI actions and external reference actions
     for (obj_num, gen_num), obj in doc.objects.items():
         _extract_uris_from_value(doc, obj.value, obj_num, results, seen)
+        _extract_external_refs(doc, obj.value, obj_num, results)
 
     # Method 2: Scan decoded stream data
     for (obj_num, gen_num), obj in doc.objects.items():
@@ -150,6 +152,98 @@ def _extract_urls_from_text(text, source, results, seen):
         if url not in seen:
             seen.add(url)
             results["urls"].append(url)
+
+
+def _extract_external_refs(doc, value, obj_num, results, depth=0, visited=None):
+    """Extract external reference actions (GoToR, SubmitForm, ImportData, Launch)."""
+    if depth > 20:
+        return
+    if visited is None:
+        visited = set()
+
+    if isinstance(value, PDFDictionary):
+        s_val = value.get("S")
+        if isinstance(s_val, PDFName):
+            action_type = s_val.name
+            ref_info = None
+
+            if action_type == "GoToR":
+                # Remote go-to: references external PDF
+                f_val = value.get("F")
+                target = _extract_string_value(f_val)
+                if target:
+                    ref_info = {
+                        "type": "GoToR",
+                        "target": target,
+                        "object": obj_num,
+                        "description": "Remote navigation to external PDF",
+                    }
+
+            elif action_type == "SubmitForm":
+                # Form submission to external URL
+                f_val = value.get("F")
+                target = _extract_string_value(f_val)
+                if target:
+                    ref_info = {
+                        "type": "SubmitForm",
+                        "target": target,
+                        "object": obj_num,
+                        "description": "Form data submission to external URL",
+                    }
+
+            elif action_type == "ImportData":
+                # Import external data
+                f_val = value.get("F")
+                target = _extract_string_value(f_val)
+                if target:
+                    ref_info = {
+                        "type": "ImportData",
+                        "target": target,
+                        "object": obj_num,
+                        "description": "External data import",
+                    }
+
+            elif action_type == "Launch":
+                # Launch external application
+                f_val = value.get("F")
+                target = _extract_string_value(f_val)
+                win = value.get("Win")
+                if isinstance(win, PDFDictionary):
+                    f_win = win.get("F")
+                    target = _extract_string_value(f_win) or target
+                if target:
+                    ref_info = {
+                        "type": "Launch",
+                        "target": target,
+                        "object": obj_num,
+                        "description": "Launch external application/file",
+                    }
+
+            if ref_info:
+                results["external_references"].append(ref_info)
+
+        # Recurse into sub-dictionaries
+        for key in value.keys():
+            child = value.get(key)
+            if isinstance(child, PDFReference):
+                ref_key = (child.obj_num, child.gen_num)
+                if ref_key not in visited:
+                    visited.add(ref_key)
+                    resolved = doc.get_object(child.obj_num, child.gen_num)
+                    if resolved:
+                        _extract_external_refs(doc, resolved.value, obj_num,
+                                               results, depth + 1, visited)
+            elif isinstance(child, (PDFDictionary, PDFArray)):
+                _extract_external_refs(doc, child, obj_num,
+                                       results, depth + 1, visited)
+
+    elif isinstance(value, PDFArray):
+        for item in value:
+            _extract_external_refs(doc, item, obj_num,
+                                   results, depth + 1, visited)
+    elif isinstance(value, PDFStream):
+        _extract_external_refs(doc, value.dictionary, obj_num,
+                               results, depth + 1, visited)
 
 
 def extract_emails(doc):
@@ -258,13 +352,23 @@ def format_url_report(results):
         for ua in results["uri_actions"]:
             lines.append(f"    Object {ua['object']}: {ua['url']}")
 
+    if results.get("external_references"):
+        lines.append("")
+        lines.append("  External References:")
+        for ref in results["external_references"]:
+            lines.append(
+                f"    [{ref['type']}] Object {ref['object']}: "
+                f"{ref['target']}"
+            )
+            lines.append(f"      {ref['description']}")
+
     if results["urls"]:
         lines.append("")
         lines.append("  All URLs:")
         for url in results["urls"]:
             lines.append(f"    {url}")
 
-    if not results["urls"]:
+    if not results["urls"] and not results.get("external_references"):
         lines.append("  No URLs found.")
 
     return "\n".join(lines)

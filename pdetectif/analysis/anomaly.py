@@ -37,6 +37,10 @@ def detect_anomalies(doc):
         "format_violations": [],
         "structure_info": {},
         "hashes": {},
+        "encryption_analysis": {},
+        "incremental_update_analysis": {},
+        "circular_references": [],
+        "action_chains": [],
         "total_severity_score": 0,
     }
 
@@ -46,6 +50,9 @@ def detect_anomalies(doc):
     _check_object_anomalies(doc, results)
     _check_trailer_anomalies(doc, results)
     _check_stream_anomalies(doc, results)
+    _check_circular_references(doc, results)
+    _check_encryption_strength(doc, results)
+    _check_incremental_updates(doc, results)
     _compute_hashes(doc, results)
     _check_structure_info(doc, results)
 
@@ -202,25 +209,51 @@ def _check_object_anomalies(doc, results):
         if d is None:
             continue
 
-        # Check for deeply nested actions
-        action_depth = _measure_action_depth(d, doc)
-        if action_depth > 5:
+        # Check for deeply nested actions and analyze action types
+        action_info = {"depth": 0, "types": []}
+        _measure_action_chain(d, doc, action_info)
+        if action_info["depth"] > 5:
             _add_anomaly(results, "Deep action nesting",
-                         f"Object {obj_num} has action nesting depth {action_depth}",
+                         f"Object {obj_num} has action nesting depth "
+                         f"{action_info['depth']}",
                          "high")
+        if action_info["types"]:
+            chain_entry = {
+                "object": obj_num,
+                "depth": action_info["depth"],
+                "action_types": action_info["types"],
+            }
+            results["action_chains"].append(chain_entry)
+            # Flag dangerous action type combinations
+            dangerous_types = {"Launch", "JavaScript", "SubmitForm", "ImportData"}
+            found_dangerous = set(action_info["types"]) & dangerous_types
+            if found_dangerous:
+                _add_anomaly(
+                    results,
+                    "Dangerous action chain",
+                    f"Object {obj_num} action chain contains: "
+                    f"{', '.join(sorted(found_dangerous))}",
+                    "high",
+                )
 
     results["structure_info"]["object_types"] = type_counts
 
 
-def _measure_action_depth(dictionary, doc, depth=0, visited=None):
-    """Measure the nesting depth of action chains."""
+def _measure_action_chain(dictionary, doc, info, depth=0, visited=None):
+    """Measure action chain depth and collect action types."""
     if depth > 50 or not isinstance(dictionary, PDFDictionary):
-        return depth
+        return
     if visited is None:
         visited = set()
 
-    max_depth = depth
+    info["depth"] = max(info["depth"], depth)
 
+    # Collect action type
+    s_val = dictionary.get("S")
+    if isinstance(s_val, PDFName):
+        info["types"].append(s_val.name)
+
+    # Follow /Next chain
     next_action = dictionary.get("Next")
     if isinstance(next_action, PDFReference):
         ref_key = (next_action.obj_num, next_action.gen_num)
@@ -228,18 +261,13 @@ def _measure_action_depth(dictionary, doc, depth=0, visited=None):
             visited.add(ref_key)
             resolved = doc.get_object(next_action.obj_num, next_action.gen_num)
             if resolved and resolved.dictionary:
-                d = _measure_action_depth(resolved.dictionary, doc, depth + 1, visited)
-                max_depth = max(max_depth, d)
+                _measure_action_chain(resolved.dictionary, doc, info, depth + 1, visited)
     elif isinstance(next_action, PDFDictionary):
-        d = _measure_action_depth(next_action, doc, depth + 1, visited)
-        max_depth = max(max_depth, d)
+        _measure_action_chain(next_action, doc, info, depth + 1, visited)
     elif isinstance(next_action, PDFArray):
         for item in next_action:
             if isinstance(item, PDFDictionary):
-                d = _measure_action_depth(item, doc, depth + 1, visited)
-                max_depth = max(max_depth, d)
-
-    return max_depth
+                _measure_action_chain(item, doc, info, depth + 1, visited)
 
 
 def _check_trailer_anomalies(doc, results):
@@ -293,13 +321,225 @@ def _check_stream_anomalies(doc, results):
                          f"{len(stream.raw_data) / (1024*1024):.1f} MB",
                          "medium")
 
+        # Check for decompression bomb (decoded >> raw)
+        if stream.raw_data and stream.decoded_data is not None:
+            raw_len = len(stream.raw_data)
+            dec_len = len(stream.decoded_data)
+            if raw_len > 0 and dec_len > 100 * raw_len:
+                _add_anomaly(
+                    results, "Potential decompression bomb",
+                    f"Object {obj_num}: decoded size ({dec_len}) is "
+                    f"{dec_len // raw_len}x the raw size ({raw_len})",
+                    "critical",
+                )
+
+
+def _check_circular_references(doc, results):
+    """Detect circular references in the object graph."""
+    for (obj_num, gen_num), obj in doc.objects.items():
+        if obj.dictionary is None:
+            continue
+        path = []
+        if _has_cycle(doc, obj.value, set(), path, depth=0):
+            cycle_str = " -> ".join(str(p) for p in path[-5:])
+            results["circular_references"].append({
+                "start_object": obj_num,
+                "cycle": cycle_str,
+            })
+            _add_anomaly(
+                results, "Circular reference detected",
+                f"Object {obj_num} is part of a reference cycle: {cycle_str}",
+                "medium",
+            )
+            # Only report first few to avoid flooding
+            if len(results["circular_references"]) >= 10:
+                return
+
+
+def _has_cycle(doc, value, visiting, path, depth):
+    """Check if following references from value leads to a cycle."""
+    if depth > 30:
+        return False
+    if isinstance(value, PDFDictionary):
+        for key in value.keys():
+            child = value.get(key)
+            if isinstance(child, PDFReference):
+                ref_key = (child.obj_num, child.gen_num)
+                if ref_key in visiting:
+                    path.append(ref_key)
+                    return True
+                visiting.add(ref_key)
+                path.append(ref_key)
+                resolved = doc.get_object(child.obj_num, child.gen_num)
+                if resolved and resolved.dictionary:
+                    if _has_cycle(doc, resolved.value, visiting, path, depth + 1):
+                        return True
+                path.pop()
+                visiting.discard(ref_key)
+    elif isinstance(value, PDFArray):
+        for item in value:
+            if isinstance(item, PDFReference):
+                ref_key = (item.obj_num, item.gen_num)
+                if ref_key in visiting:
+                    path.append(ref_key)
+                    return True
+    elif isinstance(value, PDFStream):
+        return _has_cycle(doc, value.dictionary, visiting, path, depth)
+    return False
+
+
+def _check_encryption_strength(doc, results):
+    """Analyze encryption strength when encryption is present."""
+    if not doc.encrypted or not doc.encryption_dict:
+        return
+
+    d = doc.encryption_dict
+    analysis = {}
+
+    v_val = d.get("V")
+    r_val = d.get("R")
+    length_val = d.get("Length")
+    cf_val = d.get("CF")
+
+    v = v_val.value if isinstance(v_val, PDFInteger) else v_val
+    r = r_val.value if isinstance(r_val, PDFInteger) else r_val
+    key_length = length_val.value if isinstance(length_val, PDFInteger) else None
+
+    analysis["version"] = v
+    analysis["revision"] = r
+    analysis["key_length"] = key_length
+
+    # Determine encryption algorithm and strength
+    if v == 1 or (v == 2 and (key_length is None or key_length == 40)):
+        analysis["algorithm"] = "RC4"
+        analysis["strength"] = "40-bit (weak)"
+        analysis["secure"] = False
+        _add_anomaly(results, "Weak encryption",
+                     "Document uses 40-bit RC4 encryption (easily broken)",
+                     "medium")
+    elif v == 2:
+        analysis["algorithm"] = "RC4"
+        analysis["strength"] = f"{key_length or 128}-bit"
+        analysis["secure"] = (key_length or 128) >= 128
+    elif v == 3:
+        analysis["algorithm"] = "RC4 (unpublished)"
+        analysis["strength"] = f"{key_length or 128}-bit"
+        analysis["secure"] = False
+        _add_anomaly(results, "Non-standard encryption",
+                     "Document uses unpublished encryption algorithm (V=3)",
+                     "medium")
+    elif v == 4:
+        analysis["algorithm"] = "AES-128 or RC4-128"
+        analysis["strength"] = "128-bit"
+        analysis["secure"] = True
+        # Check crypt filters for specifics
+        if isinstance(cf_val, PDFDictionary):
+            for name in cf_val.keys():
+                cf_entry = cf_val.get(name)
+                if isinstance(cf_entry, PDFDictionary):
+                    cfm = cf_entry.get("CFM")
+                    if isinstance(cfm, PDFName):
+                        if cfm.name == "AESV2":
+                            analysis["algorithm"] = "AES-128"
+                        elif cfm.name == "V2":
+                            analysis["algorithm"] = "RC4-128"
+    elif v == 5:
+        analysis["algorithm"] = "AES-256"
+        analysis["strength"] = "256-bit"
+        analysis["secure"] = True
+    else:
+        analysis["algorithm"] = "Unknown"
+        analysis["strength"] = "Unknown"
+        analysis["secure"] = False
+
+    # Check permissions
+    p_val = d.get("P")
+    if isinstance(p_val, PDFInteger):
+        perms = p_val.value
+        analysis["permissions"] = {
+            "print": bool(perms & 4),
+            "modify": bool(perms & 8),
+            "copy": bool(perms & 16),
+            "annotate": bool(perms & 32),
+            "fill_forms": bool(perms & 256),
+            "extract_accessibility": bool(perms & 512),
+            "assemble": bool(perms & 1024),
+            "print_high_quality": bool(perms & 2048),
+        }
+
+    results["encryption_analysis"] = analysis
+
+
+def _check_incremental_updates(doc, results):
+    """Analyze incremental updates for signs of manipulation."""
+    data = doc.raw_data
+
+    eof_positions = [m.start() for m in re.finditer(rb"%%EOF", data)]
+    if len(eof_positions) <= 1:
+        return
+
+    analysis = {
+        "eof_count": len(eof_positions),
+        "updates": [],
+    }
+
+    # Analyze sections between %%EOF markers
+    for i in range(len(eof_positions) - 1):
+        section_start = eof_positions[i] + 5  # after "%%EOF"
+        section_end = eof_positions[i + 1]
+        section = data[section_start:section_end]
+
+        # Count objects in this section
+        obj_pattern = rb"\b(\d+)\s+(\d+)\s+obj\b"
+        objects_in_section = re.findall(obj_pattern, section)
+
+        update_info = {
+            "section": i + 1,
+            "offset_range": f"{section_start}-{section_end}",
+            "size": section_end - section_start,
+            "objects_modified": len(objects_in_section),
+            "object_numbers": [int(m[0]) for m in objects_in_section[:20]],
+        }
+
+        # Check for xref in this section
+        has_xref = b"xref" in section or b"/Type /XRef" in section
+        update_info["has_xref"] = has_xref
+
+        analysis["updates"].append(update_info)
+
+        if len(objects_in_section) > 0:
+            _add_anomaly(
+                results,
+                "Incremental update modifies objects",
+                f"Update section {i + 1}: modifies {len(objects_in_section)} "
+                f"object(s) (objects: {update_info['object_numbers'][:5]})",
+                "info",
+            )
+
+    results["incremental_update_analysis"] = analysis
+
 
 def _compute_hashes(doc, results):
-    """Compute cryptographic hashes of the file for forensic purposes."""
+    """Compute cryptographic hashes of the file for forensic purposes.
+    
+    Uses single-pass processing to feed all three hashers simultaneously.
+    """
+    md5 = hashlib.md5()
+    sha1 = hashlib.sha1()
+    sha256 = hashlib.sha256()
+
+    data = doc.raw_data
+    chunk_size = 65536
+    for i in range(0, len(data), chunk_size):
+        chunk = data[i:i + chunk_size]
+        md5.update(chunk)
+        sha1.update(chunk)
+        sha256.update(chunk)
+
     results["hashes"] = {
-        "md5": hashlib.md5(doc.raw_data).hexdigest(),
-        "sha1": hashlib.sha1(doc.raw_data).hexdigest(),
-        "sha256": hashlib.sha256(doc.raw_data).hexdigest(),
+        "md5": md5.hexdigest(),
+        "sha1": sha1.hexdigest(),
+        "sha256": sha256.hexdigest(),
     }
 
 
@@ -361,7 +601,60 @@ def format_anomaly_report(results):
         lines.append("")
         lines.append("── Polyglot Indicators ──")
         for p in results["polyglot_indicators"]:
-            lines.append(f"  ⚠ {p}")
+            lines.append(f"  ! {p}")
+
+    # Action chains
+    if results.get("action_chains"):
+        lines.append("")
+        lines.append("── Action Chains ──")
+        for chain in results["action_chains"]:
+            types_str = " -> ".join(chain["action_types"])
+            lines.append(
+                f"  Object {chain['object']}: "
+                f"depth {chain['depth']}, types: {types_str}"
+            )
+
+    # Circular references
+    if results.get("circular_references"):
+        lines.append("")
+        lines.append("── Circular References ──")
+        for cr in results["circular_references"]:
+            lines.append(f"  Object {cr['start_object']}: {cr['cycle']}")
+
+    # Encryption analysis
+    enc = results.get("encryption_analysis", {})
+    if enc:
+        lines.append("")
+        lines.append("── Encryption Analysis ──")
+        lines.append(f"  Algorithm:   {enc.get('algorithm', 'N/A')}")
+        lines.append(f"  Strength:    {enc.get('strength', 'N/A')}")
+        lines.append(f"  Key length:  {enc.get('key_length', 'N/A')}")
+        lines.append(f"  Secure:      {'Yes' if enc.get('secure') else 'No'}")
+        perms = enc.get("permissions", {})
+        if perms:
+            allowed = [k for k, v in perms.items() if v]
+            denied = [k for k, v in perms.items() if not v]
+            if allowed:
+                lines.append(f"  Allowed:     {', '.join(allowed)}")
+            if denied:
+                lines.append(f"  Denied:      {', '.join(denied)}")
+
+    # Incremental update analysis
+    inc = results.get("incremental_update_analysis", {})
+    if inc:
+        lines.append("")
+        lines.append("── Incremental Updates ──")
+        lines.append(f"  EOF markers: {inc.get('eof_count', 0)}")
+        for upd in inc.get("updates", []):
+            lines.append(
+                f"  Update {upd['section']}: "
+                f"{upd['size']} bytes, "
+                f"{upd['objects_modified']} object(s) modified"
+            )
+            if upd["object_numbers"]:
+                lines.append(
+                    f"    Objects: {upd['object_numbers'][:10]}"
+                )
 
     lines.append("")
     lines.append(f"  Total severity score: {results['total_severity_score']}")

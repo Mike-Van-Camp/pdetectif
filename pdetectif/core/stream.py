@@ -14,6 +14,13 @@ class StreamDecodeError(Exception):
     """Raised when stream decoding fails."""
 
 
+# Maximum allowed decoded size (100 MB)
+_MAX_DECODED_SIZE = 100 * 1024 * 1024
+
+# Maximum ratio of decoded/raw size before flagging as bomb
+_MAX_DECODE_RATIO = 100
+
+
 def decode_stream(raw_data, filters, decode_params=None):
     """
     Decode a PDF stream by applying one or more filters.
@@ -25,6 +32,9 @@ def decode_stream(raw_data, filters, decode_params=None):
 
     Returns:
         bytes: The decoded data.
+
+    Raises:
+        StreamDecodeError: If decoding fails or decompression bomb detected.
     """
     if raw_data is None:
         return b""
@@ -41,6 +51,7 @@ def decode_stream(raw_data, filters, decode_params=None):
     while len(decode_params) < len(filters):
         decode_params.append(None)
 
+    raw_size = len(raw_data)
     data = raw_data
     for filt, params in zip(filters, decode_params):
         decoder = FILTER_DECODERS.get(filt)
@@ -52,6 +63,20 @@ def decode_stream(raw_data, filters, decode_params=None):
             raise
         except Exception as e:
             raise StreamDecodeError(f"Error decoding {filt}: {e}") from e
+
+        # Check for decompression bomb
+        if len(data) > _MAX_DECODED_SIZE:
+            raise StreamDecodeError(
+                f"Decoded size ({len(data)}) exceeds maximum "
+                f"allowed size ({_MAX_DECODED_SIZE}). "
+                f"Possible decompression bomb."
+            )
+        if raw_size > 0 and len(data) > raw_size * _MAX_DECODE_RATIO:
+            raise StreamDecodeError(
+                f"Decoded size ({len(data)}) is {len(data) // raw_size}x "
+                f"the raw size ({raw_size}). "
+                f"Possible decompression bomb."
+            )
 
     return data
 

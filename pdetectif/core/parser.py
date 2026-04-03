@@ -56,8 +56,10 @@ def parse_file(file_path):
 
     _parse_header(doc)
     _parse_all_xref_and_trailers(doc)
+    _detect_encryption_early(doc)
     _parse_all_objects(doc)
-    _decode_object_streams(doc)
+    if not doc.encrypted:
+        _decode_object_streams(doc)
     _detect_features(doc)
 
     return doc
@@ -116,8 +118,93 @@ def _parse_all_xref_and_trailers(doc):
                             doc.xref_streams.append(obj)
                             # The stream dict also serves as trailer
                             doc.trailers.append(d)
+                            # Parse xref stream to get object offsets
+                            xref_entries = _parse_xref_stream(obj.value, d)
+                            if xref_entries:
+                                doc.xref_tables.append(xref_entries)
                 except (PDFParseError, IndexError, ValueError):
                     pass
+
+
+def _parse_xref_stream(stream, dictionary):
+    """Parse a cross-reference stream to extract object offsets."""
+    data = stream.data
+    if data is None:
+        return {}
+
+    w_val = dictionary.get("W")
+    if not isinstance(w_val, PDFArray) or len(w_val) < 3:
+        return {}
+
+    w = []
+    for item in w_val:
+        if isinstance(item, PDFInteger):
+            w.append(item.value)
+        else:
+            w.append(int(item) if item else 0)
+
+    w1, w2, w3 = w[0], w[1], w[2]
+    entry_size = w1 + w2 + w3
+    if entry_size == 0:
+        return {}
+
+    # Get index array (subsection ranges)
+    size_val = dictionary.get("Size")
+    size = size_val.value if isinstance(size_val, PDFInteger) else 0
+
+    index_val = dictionary.get("Index")
+    if isinstance(index_val, PDFArray):
+        indices = []
+        for item in index_val:
+            if isinstance(item, PDFInteger):
+                indices.append(item.value)
+            else:
+                indices.append(int(item) if item else 0)
+    else:
+        indices = [0, size]
+
+    entries = {}
+    pos = 0
+
+    for i in range(0, len(indices), 2):
+        if i + 1 >= len(indices):
+            break
+        first_obj = indices[i]
+        count = indices[i + 1]
+
+        for j in range(count):
+            if pos + entry_size > len(data):
+                break
+
+            # Read type field
+            if w1 > 0:
+                type_val = int.from_bytes(data[pos:pos + w1], "big")
+            else:
+                type_val = 1  # default per spec
+
+            # Read field 2
+            if w2 > 0:
+                field2 = int.from_bytes(data[pos + w1:pos + w1 + w2], "big")
+            else:
+                field2 = 0
+
+            # Read field 3
+            if w3 > 0:
+                field3 = int.from_bytes(
+                    data[pos + w1 + w2:pos + w1 + w2 + w3], "big")
+            else:
+                field3 = 0
+
+            obj_num = first_obj + j
+
+            if type_val == 1:
+                # In-use object: field2=offset, field3=gen
+                entries[obj_num] = PDFXRefEntry(field2, field3, True)
+            # type 0 = free, type 2 = compressed (in object stream)
+
+            pos += entry_size
+
+    return entries
 
 
 def _parse_xref_table(data, offset):
@@ -159,31 +246,68 @@ def _parse_xref_table(data, offset):
 def _parse_all_objects(doc):
     """Find and parse all indirect objects in the document."""
     data = doc.raw_data
+    skip_decode = doc.encrypted
 
-    # Find all "N G obj" patterns
-    for m in re.finditer(rb"(\d+)\s+(\d+)\s+obj\b", data):
-        obj_num = int(m.group(1))
-        gen_num = int(m.group(2))
-        offset = m.start()
+    # Build obj_num -> offset lookup from xref for fast Length resolution
+    obj_offsets = {}
+    for xref_table in doc.xref_tables:
+        for obj_num, entry in xref_table.items():
+            if entry.in_use:
+                obj_offsets[obj_num] = entry.offset
 
-        # Skip if we already have this object (keep first occurrence or
-        # the one from a later incremental update based on xref)
-        key = (obj_num, gen_num)
+    # If we have xref data, parse objects at those offsets first
+    if obj_offsets:
+        for obj_num, offset in obj_offsets.items():
+            if offset >= len(data):
+                continue
+            # Look up gen from xref
+            gen_num = 0
+            for xref_table in doc.xref_tables:
+                if obj_num in xref_table:
+                    gen_num = xref_table[obj_num].gen_num
+                    break
+            key = (obj_num, gen_num)
+            try:
+                obj, _ = _parse_indirect_object_at(data, offset,
+                                                   skip_decode=skip_decode,
+                                                   obj_offsets=obj_offsets)
+                if obj:
+                    doc.objects[key] = obj
+            except (PDFParseError, IndexError, ValueError, RecursionError):
+                endobj_pos = data.find(b"endobj", offset, offset + 65536)
+                raw = data[offset:endobj_pos + 6] if endobj_pos and endobj_pos > offset else data[offset:offset + 100]
+                doc.objects[key] = PDFIndirectObject(
+                    obj_num, gen_num, PDFNull(), offset=offset, raw_data=raw
+                )
 
-        try:
-            obj, _ = _parse_indirect_object_at(data, offset)
-            if obj:
-                doc.objects[key] = obj
-        except (PDFParseError, IndexError, ValueError, RecursionError):
-            # Store a minimal record even if parsing fails
-            endobj_pos = data.find(b"endobj", offset)
-            raw = data[offset:endobj_pos + 6] if endobj_pos > offset else data[offset:offset + 100]
-            doc.objects[key] = PDFIndirectObject(
-                obj_num, gen_num, PDFNull(), offset=offset, raw_data=raw
-            )
+    # Also scan for objects not in xref (handles damaged/incremental PDFs)
+    # For encrypted PDFs, skip this scan since false positives in encrypted
+    # stream data would cause slowdowns
+    if not doc.encrypted:
+        for m in re.finditer(rb"(\d+)\s+(\d+)\s+obj\b", data):
+            obj_num = int(m.group(1))
+            gen_num = int(m.group(2))
+            offset = m.start()
+            key = (obj_num, gen_num)
+
+            if key in doc.objects:
+                continue
+
+            try:
+                obj, _ = _parse_indirect_object_at(data, offset,
+                                                   skip_decode=skip_decode,
+                                                   obj_offsets=obj_offsets)
+                if obj:
+                    doc.objects[key] = obj
+            except (PDFParseError, IndexError, ValueError, RecursionError):
+                endobj_pos = data.find(b"endobj", offset)
+                raw = data[offset:endobj_pos + 6] if endobj_pos and endobj_pos > offset else data[offset:offset + 100]
+                doc.objects[key] = PDFIndirectObject(
+                    obj_num, gen_num, PDFNull(), offset=offset, raw_data=raw
+                )
 
 
-def _parse_indirect_object_at(data, offset):
+def _parse_indirect_object_at(data, offset, skip_decode=False, obj_offsets=None):
     """Parse an indirect object at a specific offset."""
     match = re.match(rb"(\d+)\s+(\d+)\s+obj\b", data[offset:offset + 30])
     if not match:
@@ -209,7 +333,7 @@ def _parse_indirect_object_at(data, offset):
             pos += 1
 
         # Get stream length
-        stream_length = _get_stream_length(value, data)
+        stream_length = _get_stream_length(value, data, obj_offsets)
 
         if stream_length is not None and stream_length >= 0:
             stream_data = data[pos:pos + stream_length]
@@ -226,7 +350,8 @@ def _parse_indirect_object_at(data, offset):
                 pos = end_marker
 
         stream_obj = PDFStream(value, stream_data)
-        _try_decode_stream(stream_obj)
+        if not skip_decode:
+            _try_decode_stream(stream_obj)
         value = stream_obj
 
     # Find endobj
@@ -238,7 +363,7 @@ def _parse_indirect_object_at(data, offset):
     return obj, raw_end
 
 
-def _get_stream_length(dictionary, full_data):
+def _get_stream_length(dictionary, full_data, obj_offsets=None):
     """Extract stream length from dictionary, resolving indirect references if needed."""
     length_val = dictionary.get("Length")
     if length_val is None:
@@ -248,7 +373,21 @@ def _get_stream_length(dictionary, full_data):
     if isinstance(length_val, (int, float)):
         return int(length_val)
     if isinstance(length_val, PDFReference):
-        # Try to find and parse the referenced object
+        # Fast path: use xref offset lookup if available
+        if obj_offsets and length_val.obj_num in obj_offsets:
+            ref_offset = obj_offsets[length_val.obj_num]
+            try:
+                m = re.match(rb"(\d+)\s+(\d+)\s+obj\b",
+                             full_data[ref_offset:ref_offset + 30])
+                if m:
+                    pos = _skip_whitespace(full_data, ref_offset + m.end())
+                    val, _ = _parse_object_at(full_data, pos)
+                    if isinstance(val, PDFInteger):
+                        return val.value
+            except (PDFParseError, IndexError, ValueError):
+                pass
+
+        # Slow fallback: regex search over entire data
         match = re.search(
             rb"(?<!\d)" + str(length_val.obj_num).encode()
             + rb"\s+" + str(length_val.gen_num).encode()
@@ -257,7 +396,6 @@ def _get_stream_length(dictionary, full_data):
         )
         if match:
             try:
-                pos = match.start() + match.end() - match.start()
                 pos = _skip_whitespace(full_data, match.end())
                 val, _ = _parse_object_at(full_data, pos)
                 if isinstance(val, PDFInteger):
@@ -360,6 +498,14 @@ def _decode_object_streams(doc):
                         pass
         except (ValueError, IndexError):
             pass
+
+
+def _detect_encryption_early(doc):
+    """Detect encryption from trailers before full object parsing."""
+    for trailer in doc.trailers:
+        if "Encrypt" in trailer:
+            doc.encrypted = True
+            break
 
 
 def _detect_features(doc):
@@ -611,7 +757,9 @@ def _parse_dictionary(data, pos, depth):
     """Parse a PDF dictionary."""
     assert data[pos:pos + 2] == b"<<"
     pos += 2
+    start_pos = pos
     entries = {}
+    skipped = 0
 
     while pos < len(data):
         pos = _skip_whitespace(data, pos)
@@ -623,7 +771,11 @@ def _parse_dictionary(data, pos, depth):
 
         # Parse key (must be a name)
         if data[pos:pos + 1] != b"/":
-            # Skip invalid data
+            # Skip invalid data, but bail out if too much junk
+            skipped += 1
+            if skipped > 1024:
+                raise PDFParseError(
+                    f"Too many invalid bytes in dictionary at offset {start_pos}")
             pos += 1
             continue
 
