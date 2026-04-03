@@ -37,9 +37,12 @@ def extract_javascript(doc):
         "locations": [],
     }
 
+    visited = set()
+
     # Method 1: Find /JS entries in object dictionaries
     for (obj_num, gen_num), obj in doc.objects.items():
-        _extract_js_from_value(doc, obj.value, obj_num, gen_num, results)
+        _extract_js_from_value(doc, obj.value, obj_num, gen_num, results,
+                               visited=visited)
 
     # Method 2: Scan decoded streams for JavaScript patterns
     for (obj_num, gen_num), obj in doc.objects.items():
@@ -71,8 +74,15 @@ def extract_javascript(doc):
     return results
 
 
-def _extract_js_from_value(doc, value, obj_num, gen_num, results, path=""):
+def _extract_js_from_value(doc, value, obj_num, gen_num, results, path="",
+                            depth=0, visited=None):
     """Recursively extract JavaScript from PDF object trees."""
+    if depth > 30:
+        return
+
+    if visited is None:
+        visited = set()
+
     if isinstance(value, PDFDictionary):
         # Check /S /JavaScript or /JS entries
         s_val = value.get("S")
@@ -80,47 +90,49 @@ def _extract_js_from_value(doc, value, obj_num, gen_num, results, path=""):
             js_val = value.get("JS")
             if js_val:
                 _handle_js_value(doc, js_val, obj_num, gen_num, results,
-                                 f"{path}/Action")
+                                 f"{path}/Action", visited)
 
         # Direct /JS key
         js_val = value.get("JS")
         if js_val and not (isinstance(s_val, PDFName) and s_val.name in ("JavaScript", "JS")):
             _handle_js_value(doc, js_val, obj_num, gen_num, results,
-                             f"{path}/JS")
+                             f"{path}/JS", visited)
 
         # Check /JavaScript name tree
         js_tree = value.get("JavaScript")
         if isinstance(js_tree, PDFDictionary):
             _extract_js_from_value(doc, js_tree, obj_num, gen_num, results,
-                                   f"{path}/JavaScript")
+                                   f"{path}/JavaScript", depth + 1, visited)
 
         # Recurse into all dictionary values
         for key in value.keys():
             if key not in ("JS", "JavaScript"):
                 child = value.get(key)
                 _extract_js_from_value(doc, child, obj_num, gen_num, results,
-                                       f"{path}/{key}")
+                                       f"{path}/{key}", depth + 1, visited)
 
     elif isinstance(value, PDFArray):
         for i, item in enumerate(value):
             _extract_js_from_value(doc, item, obj_num, gen_num, results,
-                                   f"{path}[{i}]")
+                                   f"{path}[{i}]", depth + 1, visited)
 
     elif isinstance(value, PDFStream):
         _extract_js_from_value(doc, value.dictionary, obj_num, gen_num, results,
-                               path)
+                               path, depth + 1, visited)
 
     elif isinstance(value, PDFReference):
-        # Resolve reference (avoid infinite loops by not going too deep)
-        if path.count("/") < 20:
+        ref_key = (value.obj_num, value.gen_num)
+        if ref_key not in visited:
+            visited.add(ref_key)
             resolved = doc.get_object(value.obj_num, value.gen_num)
             if resolved:
                 _extract_js_from_value(doc, resolved.value,
                                        value.obj_num, value.gen_num, results,
-                                       f"ref({value.obj_num})")
+                                       f"ref({value.obj_num})",
+                                       depth + 1, visited)
 
 
-def _handle_js_value(doc, js_val, obj_num, gen_num, results, location):
+def _handle_js_value(doc, js_val, obj_num, gen_num, results, location, visited):
     """Handle a /JS value which may be a string, hex string, stream, or reference."""
     if isinstance(js_val, PDFString):
         _add_script(results, js_val.value,
@@ -141,21 +153,24 @@ def _handle_js_value(doc, js_val, obj_num, gen_num, results, location):
                 pass
 
     elif isinstance(js_val, PDFReference):
-        resolved = doc.get_object(js_val.obj_num, js_val.gen_num)
-        if resolved:
-            if resolved.is_stream:
-                data = resolved.value.data
-                if data:
-                    try:
-                        text = data.decode("latin-1", errors="replace")
-                        _add_script(results, text,
-                                    f"ref {js_val.obj_num} {js_val.gen_num}",
-                                    "referenced_stream")
-                    except (UnicodeDecodeError, AttributeError):
-                        pass
-            else:
-                _handle_js_value(doc, resolved.value, js_val.obj_num,
-                                 js_val.gen_num, results, location)
+        ref_key = (js_val.obj_num, js_val.gen_num)
+        if ref_key not in visited:
+            visited.add(ref_key)
+            resolved = doc.get_object(js_val.obj_num, js_val.gen_num)
+            if resolved:
+                if resolved.is_stream:
+                    data = resolved.value.data
+                    if data:
+                        try:
+                            text = data.decode("latin-1", errors="replace")
+                            _add_script(results, text,
+                                        f"ref {js_val.obj_num} {js_val.gen_num}",
+                                        "referenced_stream")
+                        except (UnicodeDecodeError, AttributeError):
+                            pass
+                else:
+                    _handle_js_value(doc, resolved.value, js_val.obj_num,
+                                     js_val.gen_num, results, location, visited)
 
 
 def _add_script(results, code, location, source_type):
