@@ -557,11 +557,9 @@ def _parse_name(data, pos):
 
     while pos < len(data):
         ch = data[pos]
-        if ch in _WHITESPACE[0:1] or ch in b"\x00\x09\x0a\x0c\x0d\x20" or ch in b"()<>[]{}/%":
-            # Check each whitespace/delimiter byte
-            if bytes([ch]) in (b"\x00", b"\x09", b"\x0a", b"\x0c", b"\x0d", b"\x20") or \
-               bytes([ch]) in (b"(", b")", b"<", b">", b"[", b"]", b"{", b"}", b"/", b"%"):
-                break
+        # Stop at whitespace or delimiter characters (PDF spec Table 2 & 3)
+        if ch in _WHITESPACE or ch in _DELIMITERS:
+            break
 
         if ch == ord(b"#") and pos + 2 < len(data):
             hex_val = data[pos + 1:pos + 3]

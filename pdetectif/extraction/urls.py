@@ -40,9 +40,7 @@ IP_PATTERN = re.compile(
 
 DOMAIN_PATTERN = re.compile(
     r"\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+"
-    r"(?:com|org|net|edu|gov|mil|int|info|biz|name|pro|museum|coop|aero|"
-    r"io|dev|app|xyz|online|site|tech|store|blog|cloud|ai|co|us|uk|de|fr|"
-    r"ru|cn|jp|br|in|au|ca|it|es|nl|se|no|fi|dk|pl|cz|at|ch|be|ie|pt)\b",
+    r"[a-zA-Z]{2,}\b",
     re.IGNORECASE,
 )
 
