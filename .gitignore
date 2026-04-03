@@ -1,2 +1,9 @@
 .vscode
-.pdf
+*.pdf
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
